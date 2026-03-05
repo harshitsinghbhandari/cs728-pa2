@@ -15,13 +15,13 @@ from model import make_model
 # DO THIS
 def _sigmoid_sat_dist(v: torch.Tensor) -> torch.Tensor:
     # v in [0,1]
-    pass
+    return torch.min(v, 1.0 - v)
 
 
 # DO THIS
 def _tanh_sat_dist(v: torch.Tensor) -> torch.Tensor:
     # v in [-1,1]
-    pass
+    return torch.min(1.0 - v, 1.0 + v)
 
 
 def _hidden_sat_time(model, h: torch.Tensor) -> torch.Tensor:
@@ -147,7 +147,37 @@ def grad_time_profile(task, model, x: torch.Tensor, y_onehot: torch.Tensor, coll
     # Then sat_t using _hidden_sat_time.
     # Then if extras was passed in and is a dict, and the model is GRU,
     # also compute z_sat_t and r_sat_t using _sigmoid_sat_dist on the gate pre-activations.
-
+    model.zero_grad()
+    loss, err, _, h, extras = compute_loss_and_error(task, model, x, y_onehot, return_extras=True)
+    h.retain_grad()
+    loss.backward()
+    
+    # g_t: mean_b || dL/dh_t ||_2
+    g_t = torch.norm(h.grad, p=2, dim=2).mean(dim=1)
+    
+    # a_t: mean_{b,h} activation derivative at h_t
+    act_name = getattr(model, "act_name", "tanh")
+    if act_name == "sigmoid":
+        deriv = h * (1.0 - h)
+    elif act_name == "tanh":
+        deriv = 1.0 - h * h
+    elif act_name == "identity":
+        deriv = torch.ones_like(h)
+    else:
+        raise ValueError(f"Unknown act_name={act_name}")
+    a_t = deriv.mean(dim=(1, 2))
+    
+    # sat_t: mean saturation distance from hidden activations
+    sat_t = _hidden_sat_time(model, h)
+    
+    # z_sat_t and r_sat_t for GRU
+    z_sat_t, r_sat_t = None, None
+    if extras is not None and "z" in extras and "r" in extras:
+        z_pre = extras["z"]
+        r_pre = extras["r"]
+        z_sat_t = _sigmoid_sat_dist(z_pre).mean(dim=(1, 2))
+        r_sat_t = _sigmoid_sat_dist(r_pre).mean(dim=(1, 2))
+    
     return (
         loss.detach(),
         err.detach(),
@@ -161,7 +191,12 @@ def grad_time_profile(task, model, x: torch.Tensor, y_onehot: torch.Tensor, coll
 
 # DO THIS
 def global_grad_norm(params):
-    pass
+    total_norm = 0.0
+    for p in params:
+        if p.grad is not None:
+            param_norm = p.grad.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm ** 0.5
 
 def clip_rescale(params, cutoff: float):
     # rescale grads if global norm > cutoff
